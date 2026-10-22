@@ -1,0 +1,15 @@
+FlowTrail Python
+
+This Python implementation continues the workflow design of the author's Java
+FlowTrail Server project:
+https://github.com/cloudwallker/flowtrail-server
+Reference revision: 328cd96b947486840ae963a01580eb4533abd3f1
+
+The Python source was written for this repository with AI coding assistance.
+It is a focused implementation, not a line-by-line port or a claim of feature
+parity. The inherited MIT license and original contributor notice are retained.
+The README documents the implemented persistence and deployment boundaries.
+
+Runtime dependencies are installed separately and retain their own licenses.
+No Java distribution, dependency binaries, personal data or credentials are
+included in this source repository.

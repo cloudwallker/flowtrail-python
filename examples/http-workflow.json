@@ -1,0 +1,10 @@
+{
+  "workflow": {
+    "name": "只读服务健康检查",
+    "nodes": [
+      {"id": "health", "type": "http", "depends_on": [], "config": {"connector": "demo-health", "timeout_seconds": 5}},
+      {"id": "summary", "type": "inference", "depends_on": ["health"], "config": {"prompt": "解释服务响应：${health.output}", "mode": "mock"}}
+    ]
+  },
+  "inputs": {}
+}

@@ -1,0 +1,12 @@
+{
+  "workflow": {
+    "name": "平台巡检报告（mock 推理）",
+    "nodes": [
+      {"id": "prepare", "type": "text", "depends_on": [], "config": {"template": "巡检主题：${inputs.topic}；环境：本地演示"}},
+      {"id": "summary", "type": "inference", "depends_on": ["prepare"], "config": {"prompt": "给出简短摘要：${prepare.output}", "mode": "mock"}},
+      {"id": "risks", "type": "inference", "depends_on": ["prepare"], "config": {"prompt": "检查潜在风险：${prepare.output}", "mode": "mock"}},
+      {"id": "report", "type": "text", "depends_on": ["summary", "risks"], "config": {"template": "摘要：${summary.output}\n风险：${risks.output}"}}
+    ]
+  },
+  "inputs": {"topic": "存储配额与推理服务健康状态"}
+}

@@ -1,0 +1,16 @@
+.git
+.venv
+.smoke
+**/__pycache__
+**/node_modules
+frontend/dist
+data
+output
+tmp
+.env
+.env.*
+*.sqlite*
+*.db
+*.pem
+*.key
+*.log
