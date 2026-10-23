@@ -26,6 +26,8 @@ class Settings:
     max_parallel_runs: int = 4
     max_parallel_nodes: int = 8
     per_run_parallelism: int = 4
+    db_workers: int = 4
+    db_queue: int = 32
     poll_seconds: float = 0.1
     connectors: dict[str, dict] = field(default_factory=dict)
     model_base_url: str | None = None
@@ -37,9 +39,11 @@ class Settings:
         object.__setattr__(self, "db_path", Path(self.db_path))
         object.__setattr__(self, "frontend_dir", Path(self.frontend_dir))
         for name in ("quota_bytes", "max_object_bytes", "max_request_bytes", "max_output_bytes",
-                     "max_pending_runs", "max_parallel_runs", "max_parallel_nodes", "per_run_parallelism"):
+                     "max_pending_runs", "max_parallel_runs", "max_parallel_nodes", "per_run_parallelism", "db_workers"):
             if getattr(self, name) < 1:
                 raise ValueError(f"{name} must be positive")
+        if self.db_queue < 0:
+            raise ValueError("db_queue must be non-negative")
         if not 0.005 <= self.poll_seconds <= 10:
             raise ValueError("poll_seconds must be between 0.005 and 10")
         for name, connector in self.connectors.items():
@@ -62,6 +66,8 @@ class Settings:
             max_parallel_runs=int(os.getenv("FLOWTRAIL_MAX_PARALLEL_RUNS", "4")),
             max_parallel_nodes=int(os.getenv("FLOWTRAIL_MAX_PARALLEL_NODES", "8")),
             per_run_parallelism=int(os.getenv("FLOWTRAIL_PER_RUN_PARALLELISM", "4")),
+            db_workers=int(os.getenv("FLOWTRAIL_DB_WORKERS", "4")),
+            db_queue=int(os.getenv("FLOWTRAIL_DB_QUEUE", "32")),
             connectors=json.loads(os.getenv("FLOWTRAIL_CONNECTORS_JSON", "{}")),
             model_base_url=os.getenv("FLOWTRAIL_MODEL_BASE_URL"),
             model_name=os.getenv("FLOWTRAIL_MODEL_NAME"),

@@ -14,13 +14,13 @@
 
 | 能力 | 当前实现 |
 | --- | --- |
-| 租户鉴权 | 服务端随机生成 Bearer token，绑定租户和角色；数据库只保存 SHA-256 摘要 |
+| 租户鉴权 | Bearer token 绑定租户和角色，支持过期、撤销；管理员管理本租户令牌及审计，数据库只存摘要 |
 | 工作流执行 | 校验后的 DAG，支持 text、http、inference 节点、有界并发和节点截止时间 |
 | 中断恢复 | 成功节点检查点跨重启保留；未完成节点以新的 attempt 再次执行 |
 | 外部系统接入 | HTTP 节点选择服务端配置的精确 GET 地址；推理节点使用固定的兼容模型配置 |
 | 事件回放 | SQLite 持久化 SSE 事件，支持运行内序号和 Last-Event-ID |
 | 对象管理 | 按租户隔离 SQLite BLOB，对象写入与字节配额检查使用同一事务 |
-| React 控制台 | 工作流模板、运行详情、事件历史、对象上传下载及配额展示 |
+| React 控制台 | 工作流模板、提交失败安全重试、运行详情、事件历史、对象管理及配额展示 |
 
 本项目延续 [FlowTrail Server](https://github.com/cloudwallker/flowtrail-server) 的工作流设计，用 Python 实现适合本地复现的平台接口、自动化、推理接入和权限管理闭环。
 
@@ -43,7 +43,7 @@ python -m flowtrail bootstrap --tenant demo --role admin
 python -m flowtrail serve --host 127.0.0.1 --port 8000
 ```
 
-`bootstrap` 会输出一个新生成的 token，请在本地保存，然后打开 **http://127.0.0.1:8000** 并粘贴到控制台。项目没有内置账号或默认 token。浏览器仅在内存中保存 token，刷新页面后需要重新输入。
+`bootstrap` 会输出一个新生成的 token，请在本地保存，然后打开 **http://127.0.0.1:8000** 并粘贴到控制台。默认有效期为 24 小时，`--ttl-seconds` 允许 1–2,592,000 秒。项目没有内置账号或默认 token。浏览器仅在内存中保存 token，刷新页面后需要重新输入。
 
 后端启动时若存在 `frontend/dist`，就会提供控制台首页。因此应先构建前端再启动后端；后构建时需要重启后端。默认数据库是当前工作目录下的 `data/flowtrail.sqlite3`。
 
@@ -74,6 +74,8 @@ curl --fail-with-body -i http://127.0.0.1:8000/api/runs \
 
 提交返回 **202 Accepted**、`Location` 响应头以及包含 `id` 的运行对象。同一租户重复提交相同幂等键与相同请求会返回原运行；幂等键相同但请求改变时返回 409。
 
+控制台在网络失败或超时后保留本次提交的序列化请求和随机幂等键；点击“重试本次提交”复用原键和原请求。修改工作流、切换身份、明确选择“新建一次运行”，或成功后再次提交，会建立新的提交意图。意图仅保存在浏览器内存，刷新页面后不会保留。
+
 ```sh
 RUN_ID=replace-with-the-returned-run-id
 
@@ -99,6 +101,10 @@ curl --fail-with-body "http://127.0.0.1:8000/api/runs/$RUN_ID/events?follow=fals
 | API | 作用 | 可用角色 |
 | --- | --- | --- |
 | `GET /api/me` | 当前租户及角色 | 全部 |
+| `GET /api/tokens` | 本租户最近 100 个令牌的元数据 | admin |
+| `POST /api/tokens` | 签发本租户令牌，仅返回一次明文 | admin |
+| `DELETE /api/tokens/{id}` | 按公开 ID 撤销本租户令牌 | admin |
+| `GET /api/audit?before={id}` | 最近 100 条管理审计，可用游标查更早记录 | admin |
 | `GET /api/runs` | 当前租户最近 100 个运行 | 全部 |
 | `POST /api/runs` | 提交工作流与输入 | admin、operator |
 | `GET /api/runs/{id}` | 定义、节点尝试、输出和状态 | 全部 |
@@ -111,7 +117,24 @@ curl --fail-with-body "http://127.0.0.1:8000/api/runs/$RUN_ID/events?follow=fals
 | `GET /api/quota` | 已用、上限和剩余对象字节数 | 全部 |
 | `GET /healthz` | 公开健康检查 | 无需 token |
 
-当前 `admin` 与 `operator` 的 API 写权限相同，`viewer` 只读。token 由本地管理 CLI 签发；例如 `python -m flowtrail bootstrap --tenant demo --role viewer` 可创建同租户的只读 token。
+`admin` 管理本租户令牌、查看管理审计，也可执行业务写操作；`operator` 可提交/恢复工作流和管理对象；`viewer` 只读业务资源。管理接口的租户由已认证身份决定，请求不能指定其他租户，访问其他租户的令牌 ID 返回 404。
+
+### 令牌生命周期与审计
+
+```sh
+curl --fail-with-body http://127.0.0.1:8000/api/tokens \
+  -H "Authorization: Bearer $FLOWTRAIL_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data '{"role":"viewer","ttl_seconds":3600}'
+
+curl --fail-with-body -X DELETE \
+  http://127.0.0.1:8000/api/tokens/REPLACE_WITH_PUBLIC_TOKEN_ID \
+  -H "Authorization: Bearer $FLOWTRAIL_API_TOKEN"
+```
+
+签发响应仅返回一次明文令牌，响应带有 `Cache-Control: no-store`；请在本地保存。令牌列表和审计均不包含明文或摘要。过期或撤销后，后续鉴权返回 401；事件流在批次之间重新检查令牌，失效时发送明确的 `error` 事件，携带 `code: authentication_invalid` 后关闭。客户端拒绝将部分回放当成功，控制台提示重新连接。撤销不会取消服务端已接受的工作流。签发及首次撤销与审计记录使用同一事务，记录租户、操作者公开 ID、目标公开 ID、角色、动作及时间。重复撤销为幂等操作；本地初始化记录操作者 `local-cli`。管理员可撤销自身令牌，再通过本地 bootstrap 恢复访问。
+
+旧数据库会自动执行事务迁移。既有令牌保留身份，有效期按原创建时间加 24 小时计算；已经过期的旧令牌需重新 bootstrap。迁移不改写或记录明文令牌。例如 `python -m flowtrail bootstrap --tenant demo --role viewer --ttl-seconds 3600`。
 
 对象名称使用 ASCII 字母、数字、点、连字符或下划线，并以字母或数字开头。默认单对象上限 **5 MiB**，租户对象配额 **10 MiB**。替换对象时，在同一 SQLite 事务内按新大小核算。配额只统计对象正文，不代表数据库文件、索引、工作流历史或文件系统的磁盘占用。
 
@@ -128,6 +151,8 @@ curl --fail-with-body "http://127.0.0.1:8000/api/runs/$RUN_ID/events?follow=fals
 | `FLOWTRAIL_MAX_PARALLEL_RUNS` | `4` |
 | `FLOWTRAIL_MAX_PARALLEL_NODES` | `8`；全局节点并发 |
 | `FLOWTRAIL_PER_RUN_PARALLELISM` | `4` |
+| `FLOWTRAIL_DB_WORKERS` | `4`；独立数据库工作线程数 |
+| `FLOWTRAIL_DB_QUEUE` | `32`；允许额外排队的已提交操作数，允许设为 `0` |
 | `FLOWTRAIL_CONNECTORS_JSON` | `{}`；服务端控制的精确 GET 地址及可选请求头 |
 | `FLOWTRAIL_MODEL_BASE_URL` | OpenAI 兼容基础地址，通常以 `/v1` 结尾 |
 | `FLOWTRAIL_MODEL_NAME` | 固定的服务端模型名称 |
@@ -148,6 +173,7 @@ HTTP 节点仅选择 `{"connector":"demo-health"}`，不能提交 URL、方法�
 ## 恢复机制与资源边界
 
 - **一个服务进程独占一个本地 SQLite 数据库。** OS 排他锁会拒绝第二个服务进程使用相同数据库；使用本地磁盘和单个 Uvicorn worker。
+- 独立有界线程池执行完整 Store 方法，连接创建、事务和关闭均在同一工作线程；异步 API、事件流和调度器等待其结果。已投递操作会在取消传播前完成收敛；关闭服务先收敛数据库工作，再释放进程锁。客户端断开时，已接受事务仍可能提交，因此重试必须复用幂等键。
 - 节点结果和事件在同一事务提交。启动时恢复排队及中断任务，保留成功检查点。failed 运行需要显式 resume；恢复时保留成功节点，重置未完成节点。
 - 失败节点不会自动重试。每节点累计最多执行 5 次，包括中断恢复与显式 resume。每轮执行的运行截止时间为 300 秒，节点默认 10 秒，可设为 0.05–120 秒。
 - 节点失败后不再启动依赖它的后续节点；已投递的独立任务收敛后结束运行。正常关闭服务会取消进行中的工作并记录中断。
@@ -161,15 +187,18 @@ HTTP 节点仅选择 `{"connector":"demo-health"}`，不能提交 URL、方法�
 ```sh
 python -m unittest discover -s tests -v
 python scripts/smoke.py
+python scripts/smoke_submission.py
 
 cd frontend
 npm test
 npm run build
 ```
 
-2026-10-22 的本地验证通过 **29 项后端测试**及 **7 项前端测试**。后端覆盖运行/事件/对象的租户隔离、角色权限、并发配额写入、非法 DAG、幂等冲突、截止时间、显式恢复、进程排他锁和模板展开预算。
+2026-10-23 的本地验证通过 **51 项后端测试**及 **21 项前端测试**。覆盖令牌过期/撤销/迁移/审计、角色与租户隔离、并发配额、DAG 校验、幂等冲突、截止时间、恢复、数据库提交期间取消、进程锁与模板预算。真实 SQLite 持锁测试验证心跳和 HTTP 健康接口仍可响应。前端覆盖丢响应、超时重试、载荷/身份变化、HTTP/流内身份失效及旧会话迟到响应。事件回归包含 1,500 条持久化历史与跨批次过期/撤销。
 
 冒烟脚本启动真实本地进程，使用临时凭据与数据库，在首个成功检查点后强制终止服务，再重新启动。验证已完成节点只调用一次、未完成节点再次尝试、对象数据持久化、事件回放和请求幂等；输出结果摘要，不输出访问 token。
+
+`smoke_submission.py` 还需要 Node.js。它通过本地故障代理，将实际前端 API 模块接到真实 Python 服务；第一次任务提交成功但响应丢失，重试不会创建重复任务，随后明确发起的新提交会创建新任务。所有凭据与数据库均为临时数据。
 
 仓库提供多阶段 [Dockerfile](Dockerfile)，用于构建 React 控制台并以普通用户运行 Python 服务。本次验证**未构建或运行 Docker 镜像**。使用该部署配置时，应持久化 `/app/data`。
 
@@ -181,6 +210,7 @@ npm run build
 | `src/flowtrail/models.py` | DAG 校验及有字节预算的单次模板替换 |
 | `src/flowtrail/runtime.py` | 调度、并发、截止时间与 HTTP/模型适配器 |
 | `src/flowtrail/store.py` | 事务、检查点、事件、幂等、对象和配额 |
+| `src/flowtrail/async_store.py` | 有界事务线程池、取消收敛和关闭流程 |
 | `src/flowtrail/locking.py` | 服务进程对数据库的排他占用 |
 | `src/flowtrail/__main__.py` | token 初始化与服务启动 CLI |
 | `frontend/src/` | React 运维控制台和 API 客户端 |

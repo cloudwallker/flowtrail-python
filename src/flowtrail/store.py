@@ -7,9 +7,12 @@ import secrets
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from .config import Settings
+
+DEFAULT_TOKEN_TTL = 86400
+MAX_TOKEN_TTL = 30 * 86400
 
 
 class StoreError(Exception):
@@ -58,7 +61,34 @@ class Store:
                     tenant_id TEXT NOT NULL REFERENCES tenants(id), name TEXT NOT NULL,
                     content BLOB NOT NULL, size_bytes INTEGER NOT NULL, sha256 TEXT NOT NULL,
                     updated_at TEXT NOT NULL, PRIMARY KEY(tenant_id,name));
+                CREATE TABLE IF NOT EXISTS audit_log(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id TEXT NOT NULL REFERENCES tenants(id),
+                    actor_token_id TEXT NOT NULL, action TEXT NOT NULL,
+                    target_token_id TEXT NOT NULL, role TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS audit_tenant ON audit_log(tenant_id,id);
             """)
+        self._migrate_tokens()
+
+    def _migrate_tokens(self):
+        """Upgrade in one serialized transaction; legacy credentials get a finite lifetime."""
+        with self.connection(True) as db:
+            columns = {row['name'] for row in db.execute('PRAGMA table_info(tokens)')}
+            for column in ('token_id', 'expires_at', 'revoked_at'):
+                if column not in columns:
+                    db.execute('ALTER TABLE tokens ADD COLUMN ' + column + ' TEXT')
+            for row in db.execute('SELECT digest,created_at FROM tokens WHERE token_id IS NULL OR expires_at IS NULL').fetchall():
+                try:
+                    created = datetime.fromisoformat(row['created_at'])
+                    if created.tzinfo is None:
+                        raise ValueError('Legacy creation time has no timezone')
+                    expires = (created.astimezone(timezone.utc) + timedelta(seconds=DEFAULT_TOKEN_TTL)).isoformat(timespec='milliseconds')
+                except (ValueError, TypeError):
+                    expires = '1970-01-01T00:00:00.000+00:00'
+                db.execute('UPDATE tokens SET token_id=COALESCE(token_id,?),expires_at=COALESCE(expires_at,?) WHERE digest=?',
+                           (uuid.uuid4().hex, expires, row['digest']))
+            db.execute('CREATE UNIQUE INDEX IF NOT EXISTS tokens_public_id ON tokens(token_id)')
 
     @contextmanager
     def connection(self, write=False):
@@ -81,25 +111,79 @@ class Store:
         finally:
             db.close()
 
-    def issue_token(self, tenant_id: str, role: str) -> str:
+    @staticmethod
+    def _validate_token(role, ttl_seconds):
+        if role not in {'admin', 'operator', 'viewer'}:
+            raise ValueError('Invalid role')
+        if type(ttl_seconds) is not int or not 1 <= ttl_seconds <= MAX_TOKEN_TTL:
+            raise ValueError('Token lifetime must be 1 to 2592000 seconds')
+
+    @staticmethod
+    def _issue(db, tenant_id, role, ttl_seconds, actor_token_id):
+        token, token_id, stamp = secrets.token_urlsafe(32), uuid.uuid4().hex, now()
+        expires = (datetime.fromisoformat(stamp) + timedelta(seconds=ttl_seconds)).isoformat(timespec='milliseconds')
+        db.execute('INSERT INTO tokens(digest,tenant_id,role,created_at,token_id,expires_at,revoked_at) VALUES(?,?,?,?,?,?,NULL)',
+                   (hashlib.sha256(token.encode()).hexdigest(), tenant_id, role, stamp, token_id, expires))
+        db.execute('INSERT INTO audit_log(tenant_id,actor_token_id,action,target_token_id,role,occurred_at) VALUES(?,?,?,?,?,?)',
+                   (tenant_id, actor_token_id, 'TOKEN_ISSUED', token_id, role, stamp))
+        return {'token': token, 'id': token_id, 'tenant_id': tenant_id, 'role': role, 'created_at': stamp, 'expires_at': expires, 'revoked_at': None}
+
+    def issue_token(self, tenant_id: str, role: str, ttl_seconds: int = DEFAULT_TOKEN_TTL) -> str:
+        """Local management entry point. Raw token is returned once, never persisted."""
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", tenant_id):
             raise ValueError("Invalid tenant identifier")
-        if role not in {"admin", "operator", "viewer"}:
-            raise ValueError("Invalid role")
-        token = secrets.token_urlsafe(32)
+        self._validate_token(role, ttl_seconds)
         with self.connection(True) as db:
             db.execute("INSERT OR IGNORE INTO tenants VALUES(?,?)", (tenant_id, self.settings.quota_bytes))
-            db.execute("INSERT INTO tokens VALUES(?,?,?,?)",
-                       (hashlib.sha256(token.encode()).hexdigest(), tenant_id, role, now()))
-        return token
+            return self._issue(db, tenant_id, role, ttl_seconds, 'local-cli')['token']
 
     def authenticate(self, token: str):
-        if len(token) > 256:
+        if not isinstance(token, str) or len(token) > 256:
             return None
         digest = hashlib.sha256(token.encode()).hexdigest()
         with self.connection() as db:
-            row = db.execute("SELECT tenant_id,role FROM tokens WHERE digest=?", (digest,)).fetchone()
+            row = db.execute("SELECT tenant_id,role,token_id,expires_at FROM tokens WHERE digest=? AND revoked_at IS NULL AND expires_at>?", (digest, now())).fetchone()
             return dict(row) if row else None
+
+    @staticmethod
+    def _require_admin(db, actor):
+        # Recheck inside the same transaction as a management mutation so a
+        # concurrently revoked admin cannot issue another credential afterwards.
+        row = db.execute('SELECT role FROM tokens WHERE token_id=? AND tenant_id=? AND revoked_at IS NULL AND expires_at>?',
+                         (actor['token_id'], actor['tenant_id'], now())).fetchone()
+        if row is None:
+            raise StoreError(401, 'The administrator token is no longer valid')
+        if row['role'] != 'admin':
+            raise StoreError(403, 'Administrator permission is required')
+
+    def issue_managed_token(self, actor, role, ttl_seconds=DEFAULT_TOKEN_TTL):
+        self._validate_token(role, ttl_seconds)
+        with self.connection(True) as db:
+            self._require_admin(db, actor)
+            return self._issue(db, actor['tenant_id'], role, ttl_seconds, actor['token_id'])
+
+    def list_tokens(self, actor):
+        with self.connection() as db:
+            self._require_admin(db, actor)
+            return [dict(row) for row in db.execute('SELECT token_id AS id,tenant_id,role,created_at,expires_at,revoked_at FROM tokens WHERE tenant_id=? ORDER BY created_at DESC,token_id DESC LIMIT 100', (actor['tenant_id'],))]
+
+    def revoke_token(self, actor, token_id):
+        with self.connection(True) as db:
+            self._require_admin(db, actor)
+            row = db.execute('SELECT role,revoked_at FROM tokens WHERE tenant_id=? AND token_id=?', (actor['tenant_id'], token_id)).fetchone()
+            if row is None:
+                raise StoreError(404, 'Token not found')
+            if row['revoked_at'] is None:
+                stamp = now()
+                db.execute('UPDATE tokens SET revoked_at=? WHERE tenant_id=? AND token_id=?', (stamp, actor['tenant_id'], token_id))
+                db.execute('INSERT INTO audit_log(tenant_id,actor_token_id,action,target_token_id,role,occurred_at) VALUES(?,?,?,?,?,?)',
+                           (actor['tenant_id'], actor['token_id'], 'TOKEN_REVOKED', token_id, row['role'], stamp))
+
+    def audit(self, actor, before=None):
+        with self.connection() as db:
+            self._require_admin(db, actor)
+            return [dict(row) for row in db.execute('SELECT * FROM audit_log WHERE tenant_id=? AND (? IS NULL OR id<?) ORDER BY id DESC LIMIT 100',
+                                                   (actor['tenant_id'], before, before))]
 
     @staticmethod
     def event(db, run_id, event_type, node_id=None, attempt=None, data=None):

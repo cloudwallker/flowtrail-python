@@ -14,13 +14,13 @@
 
 | Capability | Implemented behavior |
 | --- | --- |
-| Tenant access | Random bearer tokens bind a tenant and role on the server; only SHA-256 token hashes are stored |
+| Tenant access | Hashed bearer tokens bind tenant and role, expire, and can be revoked; administrators manage tenant tokens and audit records |
 | Workflow execution | Validated DAGs with `text`, `http`, and `inference` nodes; bounded concurrency and node deadlines |
 | Recovery | Successful node checkpoints survive restart; unfinished nodes run again under a new attempt number |
 | External integration | HTTP nodes call exact server-configured GET endpoints; model nodes use a fixed OpenAI-compatible configuration |
 | Event replay | SQLite-backed SSE with per-run sequence IDs and `Last-Event-ID` replay |
 | Object management | Tenant-scoped SQLite BLOB objects with an atomic byte quota check and write |
-| React console | Workflow templates, run inspection, event history, object upload/download, and quota display |
+| React console | Workflow templates, safe submission retries, run inspection, event history, object management, and quota display |
 
 This is a focused Python continuation of [FlowTrail Server](https://github.com/cloudwallker/flowtrail-server). It targets reproducible local demonstrations of platform APIs, automation, inference integration, and authorization.
 
@@ -43,7 +43,7 @@ python -m flowtrail bootstrap --tenant demo --role admin
 python -m flowtrail serve --host 127.0.0.1 --port 8000
 ```
 
-`bootstrap` prints one newly generated token. Save it locally and paste it into the console at **http://127.0.0.1:8000**. There is no built-in account or default token. The browser keeps the token in memory; a page reload requires entering it again.
+`bootstrap` prints one newly generated token. Save it locally and paste it into the console at **http://127.0.0.1:8000**. The default lifetime is 24 hours; `--ttl-seconds` accepts 1–2,592,000 seconds. There is no built-in account or default token. The browser keeps the token in memory; a page reload requires entering it again.
 
 The backend serves `frontend/dist` when that directory exists at startup. Build the frontend before starting the backend, or restart it after the build. The database defaults to `data/flowtrail.sqlite3`, relative to the working directory.
 
@@ -74,6 +74,8 @@ curl --fail-with-body -i http://127.0.0.1:8000/api/runs \
 
 The second request returns **202 Accepted**, a `Location` header, and a run with an `id`. Reusing the same idempotency key and request within a tenant returns the same run; a changed request returns 409.
 
+The console retains a serialized submission and its random idempotency key after a network failure or timeout. **Retry this submission** sends the same key and body. Editing the workflow, changing identity, explicitly choosing **Create a new run**, or submitting again after success starts a new intent. Intents live in browser memory and do not survive a reload.
+
 ```sh
 RUN_ID=replace-with-the-returned-run-id
 
@@ -99,6 +101,10 @@ All business APIs require `Authorization: Bearer …`. Tenant identity comes fro
 | API | Purpose | Roles |
 | --- | --- | --- |
 | `GET /api/me` | Current tenant and role | All |
+| `GET /api/tokens` | Latest 100 tenant token metadata records | admin |
+| `POST /api/tokens` | Issue a tenant token; return the raw value once | admin |
+| `DELETE /api/tokens/{id}` | Revoke a tenant token by public ID | admin |
+| `GET /api/audit?before={id}` | Latest 100 management audit records; optional older-page cursor | admin |
 | `GET /api/runs` | Most recent 100 runs in the tenant | All |
 | `POST /api/runs` | Submit a workflow and inputs | admin, operator |
 | `GET /api/runs/{id}` | Definition, node attempts, outputs, and status | All |
@@ -111,7 +117,24 @@ All business APIs require `Authorization: Bearer …`. Tenant identity comes fro
 | `GET /api/quota` | Used, allowed, and remaining object bytes | All |
 | `GET /healthz` | Public health check | No token required |
 
-`admin` and `operator` currently have the same API write permissions; `viewer` is read-only. Token issuance is a local management CLI operation. You can issue a viewer token with `python -m flowtrail bootstrap --tenant demo --role viewer`.
+`admin` manages tokens and audit records and can perform business writes. `operator` can submit/resume workflows and manage objects, while `viewer` can only read business resources. Management APIs use the authenticated tenant; a request cannot supply another tenant. A foreign token ID returns 404.
+
+### Token lifecycle and audit
+
+```sh
+curl --fail-with-body http://127.0.0.1:8000/api/tokens \
+  -H "Authorization: Bearer $FLOWTRAIL_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data '{"role":"viewer","ttl_seconds":3600}'
+
+curl --fail-with-body -X DELETE \
+  http://127.0.0.1:8000/api/tokens/REPLACE_WITH_PUBLIC_TOKEN_ID \
+  -H "Authorization: Bearer $FLOWTRAIL_API_TOKEN"
+```
+
+The issue response contains the raw token once and uses `Cache-Control: no-store`. Copy it locally; lists and audit records never expose it or its hash. Expired or revoked tokens fail subsequent authentication with 401; event streams recheck the token between batches and send an explicit `error` event with `code: authentication_invalid` before closing if access becomes invalid. Clients reject that partial replay, and the console asks for reconnection. Revocation does not cancel a workflow already accepted by the server. Issuance and first revocation commit with an audit record containing tenant, actor public ID, target public ID, role, action, and timestamp. Repeated revocation is idempotent. Local bootstrap is recorded as `local-cli`; an admin may revoke itself and recover through local bootstrap.
+
+An existing database is upgraded transactionally. Legacy tokens retain their identity and expire 24 hours after their original creation; already old tokens therefore require a new bootstrap. No token value is rewritten or logged. Example: `python -m flowtrail bootstrap --tenant demo --role viewer --ttl-seconds 3600`.
 
 Object names use ASCII letters, digits, dot, dash, or underscore and start with a letter or digit. The default object limit is **5 MiB** and the default tenant object quota is **10 MiB**. Replacing an object accounts for its new size inside the same SQLite transaction. Quota measures object contents only; it does not measure database files, indexes, workflow history, or filesystem capacity.
 
@@ -128,6 +151,8 @@ Configuration is read from the process environment. An `.env` file is not loaded
 | `FLOWTRAIL_MAX_PARALLEL_RUNS` | `4` |
 | `FLOWTRAIL_MAX_PARALLEL_NODES` | `8`; global node concurrency |
 | `FLOWTRAIL_PER_RUN_PARALLELISM` | `4` |
+| `FLOWTRAIL_DB_WORKERS` | `4`; dedicated database worker threads |
+| `FLOWTRAIL_DB_QUEUE` | `32`; additional submitted operations allowed to queue; `0` is valid |
 | `FLOWTRAIL_CONNECTORS_JSON` | `{}`; exact server-controlled GET URLs and optional headers |
 | `FLOWTRAIL_MODEL_BASE_URL` | OpenAI-compatible base URL, usually ending in `/v1` |
 | `FLOWTRAIL_MODEL_NAME` | Fixed server model identifier |
@@ -148,6 +173,7 @@ Inference nodes default to `"mode":"mock"`, which returns a clearly labeled dete
 ## Recovery and resource boundaries
 
 - **One serving process owns one local SQLite database.** An OS-level exclusive lock rejects a second server using the same database. Use local storage and one Uvicorn worker.
+- A dedicated bounded worker pool runs complete Store methods, including their connection and transaction. Async API, event, and runtime paths await this pool. Cancellation drains an already submitted operation before returning; shutdown drains database work before releasing the process lock. A client disconnect can still leave an accepted transaction committed, so retries must reuse an idempotency key.
 - Node results and their events commit together. Startup recovers queued and interrupted work, preserving successful checkpoints. A failed run requires an explicit resume; successful nodes are retained while unfinished nodes are reset.
 - Failed nodes are not automatically retried. Each node may execute at most five times across recovery and explicit resume. Each execution cycle has a 300-second run deadline; node deadlines default to 10 seconds and accept 0.05–120 seconds.
 - A failed node prevents downstream work from starting; already submitted independent work settles before the run finishes. Graceful shutdown cancels active work and records interruption.
@@ -161,15 +187,18 @@ The implementation uses SQLite BLOBs as a small object service. It does not impl
 ```sh
 python -m unittest discover -s tests -v
 python scripts/smoke.py
+python scripts/smoke_submission.py
 
 cd frontend
 npm test
 npm run build
 ```
 
-The 2026-10-22 local verification passed **29 backend tests** and **7 frontend tests**. Backend coverage includes tenant isolation across runs/events/objects, roles, concurrent quota writes, malformed DAGs, idempotency conflicts, deadlines, explicit resume, process ownership, and bounded template expansion.
+The 2026-10-23 local verification passed **51 backend tests** and **21 frontend tests**. Coverage includes token expiry/revocation/migration/audit, role and tenant isolation, concurrent quotas, DAG validation, idempotency conflicts, deadlines, resume, cancellation during database commits, process ownership, and bounded templates. A real SQLite write lock verifies that an unrelated heartbeat and the HTTP health endpoint keep responding. Frontend tests cover lost responses, timeouts, payload/identity changes, HTTP/stream session invalidation, and late responses from an old session. Event regressions cover 1,500 persisted events and token expiry/revocation between storage batches.
 
 The smoke script starts real local processes, creates temporary credentials and a database, forcibly terminates the server after a successful checkpoint, and restarts it. It verifies one call to the completed node, another attempt for the unfinished node, persistent object contents, event replay, and request idempotency. It prints a result summary without the access token.
+
+`smoke_submission.py` additionally requires Node.js. It runs the actual frontend API module against a real Python server through a local fault proxy. The first successful submission loses its response; retry creates no duplicate, and the next intentional submission creates a new run. All credentials and database contents are temporary.
 
 The repository includes a multi-stage [Dockerfile](Dockerfile) that builds the React console and runs the Python service as an unprivileged user. The Docker image was **not built or run** during this verification. Persist `/app/data` if you use that deployment configuration.
 
@@ -181,6 +210,7 @@ The repository includes a multi-stage [Dockerfile](Dockerfile) that builds the R
 | `src/flowtrail/models.py` | DAG validation and bounded one-pass template rendering |
 | `src/flowtrail/runtime.py` | Scheduling, concurrency, deadlines, and HTTP/model adapters |
 | `src/flowtrail/store.py` | Transactions, checkpoints, events, idempotency, objects, and quotas |
+| `src/flowtrail/async_store.py` | Bounded transaction offload, cancellation draining, and worker shutdown |
 | `src/flowtrail/locking.py` | Exclusive database ownership by one server process |
 | `src/flowtrail/__main__.py` | Token bootstrap and server CLI |
 | `frontend/src/` | React operations console and API client |

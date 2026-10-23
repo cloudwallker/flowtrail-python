@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { createApi, formatBytes, parseWorkflow, SAMPLE_WORKFLOW, statusLabels } from './api.mjs';
+import { createApi, createRunSubmission, createSessionBoundary, formatBytes, parseWorkflow, SAMPLE_WORKFLOW, statusLabels } from './api.mjs';
 
 function Icon({ name, size = 20, ...props }) {
   const paths = {
@@ -62,12 +62,19 @@ export default function App() {
   const [busy, setBusy] = useState('');
   const [dsl, setDsl] = useState(JSON.stringify(SAMPLE_WORKFLOW, null, 2));
   const [dslError, setDslError] = useState('');
+  const [retryPending, setRetryPending] = useState(false);
   const [file, setFile] = useState(null);
   const [activeSection, setActiveSection] = useState('overview');
   const fileInput = useRef(null);
-  const session = useRef(0);
   const connection = useRef(null);
-  const api = useMemo(() => createApi(token), [token]);
+  const submission = useRef(createRunSubmission());
+  const session = useRef(null);
+  if (!session.current) session.current = createSessionBoundary(() => {
+    connection.current?.abort();
+    clearSession();
+    setConnectionError('当前身份已失效，请重新连接平台。');
+  });
+  const api = useMemo(() => session.current.api(token), [token, identity]);
   const connected = Boolean(identity && token);
   const writable = connected && ['admin', 'operator'].includes(identity.role);
   const successful = runs.filter(item => item.status === 'succeeded').length;
@@ -78,7 +85,8 @@ export default function App() {
     event.preventDefault();
     const candidate = draftToken.trim();
     if (!candidate) { setConnectionError('请输入后端启动时配置的服务令牌。'); return; }
-    const current = ++session.current;
+    const current = session.current.advance();
+    submission.current.reset(); setRetryPending(false);
     connection.current?.abort();
     const controller = new AbortController();
     connection.current = controller;
@@ -90,27 +98,34 @@ export default function App() {
         candidateApi.me(controller.signal),
         candidateApi.request('/healthz', { signal: controller.signal }),
       ]);
-      if (session.current !== current) return;
+      if (session.current.version !== current) return;
       setIdentity(nextIdentity);
       setToken(candidate);
       setDraftToken('');
       setNotice({ type: 'success', text: `已连接租户 ${nextIdentity.tenant_id}，数据来自 Python 后端。` });
     } catch (error) {
-      if (error.name !== 'AbortError' && session.current === current) setConnectionError(error.message);
-    } finally { if (session.current === current) setConnecting(false); }
+      if (error.name !== 'AbortError' && session.current.version === current) setConnectionError(error.message);
+    } finally { if (session.current.version === current) setConnecting(false); }
   }
 
-  function disconnect() {
-    ++session.current;
-    connection.current?.abort();
+  function clearSession() {
+    submission.current.reset(); setRetryPending(false);
     setToken(''); setDraftToken(''); setIdentity(null); setRuns([]); setObjects([]); setQuota(null);
     setSelected(''); setRun(null); setEvents([]); setNotice(null); setBusy('');
     setConnectionError(''); setOverviewError(''); setDetailError(''); setFile(null);
+    setConnecting(false); setLoading(false); setDetailLoading(false);
     if (fileInput.current) fileInput.current.value = '';
+  }
+
+  function disconnect() {
+    session.current.advance();
+    connection.current?.abort();
+    clearSession();
   }
 
   useEffect(() => {
     if (!connected) return;
+    const current = session.current.version;
     const controller = new AbortController();
     let fetching = false;
     const refresh = async () => {
@@ -119,13 +134,13 @@ export default function App() {
       setLoading(true);
       try {
         const [nextRuns, nextObjects, nextQuota] = await Promise.all([api.runs(controller.signal), api.objects(controller.signal), api.quota(controller.signal)]);
-        if (controller.signal.aborted) return;
+        if (controller.signal.aborted || session.current.version !== current) return;
         setRuns(nextRuns.items); setObjects(nextObjects.items); setQuota(nextQuota);
         setSelected(current => nextRuns.items.some(item => item.id === current) ? current : nextRuns.items[0]?.id ?? '');
         setOverviewError('');
       } catch (error) {
-        if (!controller.signal.aborted) setOverviewError(error.message);
-      } finally { fetching = false; if (!controller.signal.aborted) setLoading(false); }
+        if (!controller.signal.aborted && session.current.version === current) setOverviewError(error.message);
+      } finally { fetching = false; if (!controller.signal.aborted && session.current.version === current) setLoading(false); }
     };
     refresh();
     const timer = setInterval(refresh, 5000);
@@ -135,6 +150,7 @@ export default function App() {
   useEffect(() => {
     setRun(null); setEvents([]); setDetailError('');
     if (!connected || !selected) { setDetailLoading(false); return; }
+    const current = session.current.version;
     const controller = new AbortController();
     let fetching = false;
     const refresh = async () => {
@@ -143,10 +159,10 @@ export default function App() {
       setDetailLoading(true);
       try {
         const [nextRun, nextEvents] = await Promise.all([api.run(selected, controller.signal), api.events(selected, controller.signal)]);
-        if (controller.signal.aborted) return;
+        if (controller.signal.aborted || session.current.version !== current) return;
         setRun(nextRun); setEvents(nextEvents); setDetailError('');
-      } catch (error) { if (!controller.signal.aborted) setDetailError(error.message); }
-      finally { fetching = false; if (!controller.signal.aborted) setDetailLoading(false); }
+      } catch (error) { if (!controller.signal.aborted && session.current.version === current) setDetailError(error.message); }
+      finally { fetching = false; if (!controller.signal.aborted && session.current.version === current) setDetailLoading(false); }
     };
     refresh();
     const timer = setInterval(refresh, 1800);
@@ -156,23 +172,35 @@ export default function App() {
   useEffect(() => () => { connection.current?.abort(); }, []);
 
   async function action(label, operation, onSuccess) {
-    const current = session.current;
+    const current = session.current.version;
     setBusy(label); setNotice(null);
     try {
       const result = await operation();
-      if (session.current !== current) return;
+      if (session.current.version !== current) return;
       onSuccess?.(result);
       setTick(value => value + 1);
     } catch (error) {
-      if (session.current === current) setNotice({ type: 'error', text: error.message });
-    } finally { if (session.current === current) setBusy(''); }
+      if (session.current.version === current) setNotice({ type: 'error', text: error.message });
+    } finally { if (session.current.version === current) setBusy(''); }
   }
 
-  function submitWorkflow() {
+  function editWorkflow(value) {
+    submission.current.reset(); setRetryPending(false);
+    setDsl(value); setDslError('');
+  }
+
+  function submitWorkflow(newRun = false) {
+    if (busy !== '') return;
     let body;
     try { body = parseWorkflow(dsl); setDslError(''); }
     catch (error) { setDslError(error.message); return; }
-    action('run', () => api.createRun(body), result => {
+    if (newRun) submission.current.reset();
+    const currentSession = session.current.version;
+    const scope = JSON.stringify([currentSession, token, identity?.tenant_id, identity?.role]);
+    action('run', async () => {
+      try { return await submission.current.submit(api, scope, body); }
+      finally { if (session.current.version === currentSession) setRetryPending(submission.current.pending); }
+    }, result => {
       setSelected(result.id);
       setNotice({ type: 'success', text: '工作流已提交，节点状态与执行事件将自动刷新。' });
       document.getElementById('runs')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -240,7 +268,7 @@ export default function App() {
         </div>
 
         <div className="authoring-layout">
-          <section className="panel composer-panel" id="composer" aria-labelledby="composer-title"><div className="panel-heading"><div><h2 id="composer-title">工作流编排</h2><p>用 JSON 定义节点、依赖关系与输入参数</p></div><span className="subtle-badge">DAG DSL</span></div><div className="editor-toolbar"><span><span className="file-dot" />workflow.json</span><button className="text-button" onClick={() => { setDsl(JSON.stringify(SAMPLE_WORKFLOW, null, 2)); setDslError(''); }}>填入示例</button></div><label htmlFor="workflow-editor" className="sr-only">工作流 JSON 请求</label><textarea id="workflow-editor" className="code-editor" spellCheck="false" value={dsl} onChange={event => setDsl(event.target.value)} aria-describedby="workflow-hint" aria-invalid={Boolean(dslError)} />{dslError && <p className="inline-error editor-error" role="alert">{dslError}</p>}<div className="composer-footer"><p id="workflow-hint">示例使用 <code>mock</code> 推理，无需模型密钥。<br />{connected && !writable ? '当前为只读角色，可查看工作流与运行结果。' : '提交后由 Python 引擎按依赖调度执行。'}</p><button className="button primary" disabled={!writable || busy !== ''} onClick={submitWorkflow}><Icon name="play" size={16} />{busy === 'run' ? '提交中…' : '运行工作流'}</button></div></section>
+          <section className="panel composer-panel" id="composer" aria-labelledby="composer-title"><div className="panel-heading"><div><h2 id="composer-title">工作流编排</h2><p>用 JSON 定义节点、依赖关系与输入参数</p></div><span className="subtle-badge">DAG DSL</span></div><div className="editor-toolbar"><span><span className="file-dot" />workflow.json</span><button className="text-button" onClick={() => editWorkflow(JSON.stringify(SAMPLE_WORKFLOW, null, 2))}>填入示例</button></div><label htmlFor="workflow-editor" className="sr-only">工作流 JSON 请求</label><textarea id="workflow-editor" className="code-editor" spellCheck="false" value={dsl} onChange={event => editWorkflow(event.target.value)} aria-describedby="workflow-hint" aria-invalid={Boolean(dslError)} />{dslError && <p className="inline-error editor-error" role="alert">{dslError}</p>}<div className="composer-footer"><p id="workflow-hint">示例使用 <code>mock</code> 推理，无需模型密钥。<br />{connected && !writable ? '当前为只读角色，可查看工作流与运行结果。' : retryPending ? '上次提交结果未确认；重试会沿用原请求。新建运行可能产生另一条任务。' : '提交后由 Python 引擎按依赖调度执行。'}</p><div className="composer-actions">{retryPending && <button className="button secondary" disabled={!writable || busy !== ''} onClick={() => submitWorkflow(true)}>新建一次运行</button>}<button className="button primary" disabled={!writable || busy !== ''} onClick={() => submitWorkflow()}><Icon name="play" size={16} />{busy === 'run' ? '提交中…' : retryPending ? '重试本次提交' : '运行工作流'}</button></div></div></section>
 
           <section className="panel event-panel" aria-labelledby="events-title"><div className="panel-heading"><div><h2 id="events-title">执行事件</h2><p>持久化事件回放 · 自动刷新</p></div><span className="count">{events.length}</span></div>{events.length ? <ol className="event-list">{events.map((event, index) => <li key={`${event.seq}-${index}`} className={event.type?.includes('FAILED') ? 'event-failed' : ''}><span className="event-bullet" /><div className="event-main"><div className="event-heading"><code>{event.type}</code><small>#{event.seq}</small></div><span className="event-time">{readableTime(event.created_at)}{event.node_id ? ` · ${event.node_id}` : ''}</span>{event.data != null && <details><summary>查看事件数据</summary><Output value={event.data} /></details>}</div></li>)}</ol> : <Empty icon="terminal" title="等待执行事件">任务提交后，可追踪节点开始、成功、失败与恢复过程。</Empty>}<div className="event-note"><Icon name="shield" size={14} />通过认证请求读取 SSE 事件回放</div></section>
         </div>

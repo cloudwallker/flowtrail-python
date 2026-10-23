@@ -34,7 +34,7 @@ export function parseSSE(source) {
     let payload;
     try { payload = JSON.parse(raw); } catch { payload = { data: raw }; }
     if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) payload = { data: payload };
-    return [{ ...payload, type: payload.type ?? event, seq: payload.seq ?? id }];
+    return [{ ...payload, type: event === 'error' ? 'error' : payload.type ?? event, seq: payload.seq ?? id }];
   });
 }
 
@@ -64,7 +64,52 @@ export function formatBytes(value) {
   return `${(bytes / 1024 ** unit).toFixed(unit === 1 ? 1 : 2)} ${['B', 'KB', 'MB', 'GB'][unit]}`;
 }
 
-export function createApi(token) {
+// Keep a failed submission in memory until it succeeds, changes, or is abandoned.
+// The serialized snapshot prevents the same key being sent with a mutated body.
+export function createRunSubmission() {
+  let intent = null;
+  return {
+    get pending() { return intent !== null; },
+    reset() { intent = null; },
+    async submit(api, scope, body) {
+      const payload = JSON.stringify(body);
+      if (!intent || intent.scope !== scope || intent.payload !== payload) {
+        intent = { scope, payload, key: crypto.randomUUID() };
+      }
+      const current = intent;
+      const result = await api.createRun(JSON.parse(current.payload), current.key);
+      // A prior session may finish after the user has switched identities.
+      if (intent === current) intent = null;
+      return result;
+    },
+  };
+}
+
+// Bind all accepted-session requests to a generation. An old request can fail
+// after reconnecting without invalidating the new tenant's session.
+export function createSessionBoundary(onUnauthorized) {
+  let version = 0;
+  return {
+    get version() { return version; },
+    advance() { return ++version; },
+    api(token) {
+      const owner = version;
+      return createApi(token, { onUnauthorized: () => {
+        if (owner !== version) return;
+        ++version;
+        onUnauthorized();
+      } });
+    },
+  };
+}
+
+export function createApi(token, { onUnauthorized } = {}) {
+  function fail(message, status) {
+    const error = Object.assign(new Error(message), { status });
+    if (status === 401) onUnauthorized?.(error);
+    throw error;
+  }
+
   async function request(path, options = {}) {
     const { responseType = 'json', ...init } = options;
     const headers = new Headers(init.headers);
@@ -82,7 +127,7 @@ export function createApi(token) {
       const fallback = response.status === 401 ? '身份验证失败，请检查服务令牌。'
         : response.status === 403 ? '当前角色没有执行此操作的权限。'
           : `请求失败（HTTP ${response.status}）`;
-      throw new Error(errorMessage(payload, fallback, token));
+      fail(errorMessage(payload, fallback, token), response.status);
     }
     if (response.status === 204) return null;
     if (responseType === 'blob') return response.blob();
@@ -94,9 +139,21 @@ export function createApi(token) {
     me: signal => request('/api/me', { signal }),
     runs: signal => request('/api/runs', { signal }),
     run: (id, signal) => request(`/api/runs/${encodeURIComponent(id)}`, { signal }),
-    createRun: body => request('/api/runs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
+    createRun: (body, idempotencyKey) => request('/api/runs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {}) },
+      body: JSON.stringify(body),
+    }),
     resume: id => request(`/api/runs/${encodeURIComponent(id)}/resume`, { method: 'POST' }),
-    events: async (id, signal) => parseSSE(await request(`/api/runs/${encodeURIComponent(id)}/events?follow=false`, { signal, responseType: 'text' })),
+    events: async (id, signal) => {
+      const events = parseSSE(await request(`/api/runs/${encodeURIComponent(id)}/events?follow=false`, { signal, responseType: 'text' }));
+      const errors = events.filter(event => event.type === 'error');
+      if (errors.some(error => error.code === 'authentication_invalid')) {
+        fail('当前身份已失效，请重新连接平台。', 401);
+      }
+      if (errors.length) fail('读取运行事件失败，请刷新后重试。');
+      return events;
+    },
     quota: signal => request('/api/quota', { signal }),
     objects: signal => request('/api/objects', { signal }),
     upload: file => request(`/api/objects/${encodeURIComponent(file.name)}`, { method: 'PUT', body: file, headers: { 'Content-Type': 'application/octet-stream' } }),

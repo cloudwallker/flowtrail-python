@@ -7,6 +7,7 @@ import logging
 import httpx
 
 from .config import Settings
+from .async_store import AsyncStore, finish_before_cancel
 from .locking import RuntimeLock
 from .models import render
 from .store import Store
@@ -19,23 +20,34 @@ class NodeFailure(Exception):
 
 
 class Runtime:
-    def __init__(self, store: Store, settings: Settings):
+    def __init__(self, store: Store, settings: Settings, db: AsyncStore | None = None):
         self.store, self.settings = store, settings
+        self.db = db if db is not None else AsyncStore(
+            store, max_workers=settings.db_workers, max_queue=settings.db_queue)
         self.lock = RuntimeLock(settings.db_path)
         self.tasks: dict[str, asyncio.Task] = {}
         self.scheduler = None
         self.capacity = asyncio.Semaphore(settings.max_parallel_nodes)
+        self._stop_task = None
 
     async def start(self):
-        self.lock.acquire()
         try:
-            self.store.recover()
+            self.lock.acquire()
+            await self.db.call("recover")
             self.scheduler = asyncio.create_task(self._schedule(), name="flowtrail-scheduler")
         except BaseException:
-            self.lock.release()
+            try:
+                await self.db.close()
+            finally:
+                self.lock.release()
             raise
 
     async def stop(self):
+        if self._stop_task is None:
+            self._stop_task = asyncio.create_task(self._stop(), name="flowtrail-runtime-stop")
+        await finish_before_cancel(self._stop_task)
+
+    async def _stop(self):
         try:
             if self.scheduler:
                 self.scheduler.cancel()
@@ -46,7 +58,10 @@ class Runtime:
             await asyncio.gather(*running, return_exceptions=True)
             self.tasks.clear()
         finally:
-            self.lock.release()
+            try:
+                await self.db.close()
+            finally:
+                self.lock.release()
 
     async def _schedule(self):
         while True:
@@ -59,8 +74,18 @@ class Runtime:
                         self.tasks.pop(run_id, None)
                 slots = self.settings.max_parallel_runs - len(self.tasks)
                 if slots > 0:
-                    for run in self.store.queued(slots):
-                        if self.store.start_run(run["id"]):
+                    for run in await self.db.call("queued", slots):
+                        try:
+                            claimed = await self.db.call("start_run", run["id"])
+                        except asyncio.CancelledError:
+                            # The transaction may have committed before cancellation
+                            # reached its awaiting caller. No run task exists yet.
+                            detail = await self.db.call("get_run", run["tenant_id"], run["id"])
+                            if detail["status"] == "running":
+                                await self.db.call("finish_run", run["id"], "interrupted",
+                                                   "Server stopped during execution")
+                            raise
+                        if claimed:
                             self.tasks[run["id"]] = asyncio.create_task(
                                 self._run(run["tenant_id"], run["id"]), name="flowtrail-run")
             except Exception as error:
@@ -73,18 +98,18 @@ class Runtime:
             async with asyncio.timeout(300):
                 await self._run_nodes(tenant_id, run_id)
         except asyncio.CancelledError:
-            self.store.finish_run(run_id, "interrupted", "Server stopped during execution")
+            await self.db.call("finish_run", run_id, "interrupted", "Server stopped during execution")
             raise
         except TimeoutError:
-            self.store.finish_run(run_id, "failed", "Run exceeded its 300 second deadline")
+            await self.db.call("finish_run", run_id, "failed", "Run exceeded its 300 second deadline")
         except Exception:
-            self.store.finish_run(run_id, "failed", "Internal execution error")
+            await self.db.call("finish_run", run_id, "failed", "Internal execution error")
 
     async def _run_nodes(self, tenant_id, run_id):
         active: dict[str, asyncio.Task] = {}
         try:
             while True:
-                run = self.store.get_run(tenant_id, run_id)
+                run = await self.db.call("get_run", tenant_id, run_id)
                 states = {node["id"]: node for node in run["nodes"]}
                 failed = any(node["status"] in {"failed", "interrupted"} for node in states.values())
                 outputs = {node_id: node["output"] for node_id, node in states.items() if node["status"] == "succeeded"}
@@ -97,11 +122,11 @@ class Runtime:
                             continue
                         if all(states[dep]["status"] == "succeeded" for dep in definition["depends_on"]):
                             active[node_id] = asyncio.create_task(
-                                self._execute(run_id, definition, run["inputs"], outputs.copy()))
+                                self._execute(tenant_id, run_id, definition, run["inputs"], outputs.copy()))
                 if not active:
                     complete = all(node["status"] == "succeeded" for node in states.values())
-                    self.store.finish_run(run_id, "succeeded" if complete else "failed",
-                                          None if complete else "One or more nodes failed")
+                    await self.db.call("finish_run", run_id, "succeeded" if complete else "failed",
+                                       None if complete else "One or more nodes failed")
                     return
                 done, _ = await asyncio.wait(active.values(), return_when=asyncio.FIRST_COMPLETED)
                 for node_id, task in list(active.items()):
@@ -113,29 +138,32 @@ class Runtime:
                 task.cancel()
             await asyncio.gather(*active.values(), return_exceptions=True)
 
-    async def _execute(self, run_id, node, inputs, outputs):
-        started = False
+    async def _execute(self, tenant_id, run_id, node, inputs, outputs):
+        start_requested = False
         try:
             async with self.capacity:
-                attempt = self.store.start_node(run_id, node["id"])
-                started = True
+                start_requested = True
+                attempt = await self.db.call("start_node", run_id, node["id"])
                 if attempt > 5:
                     raise NodeFailure("Node attempt budget exhausted (maximum 5)")
                 async with asyncio.timeout(node["config"].get("timeout_seconds", 10)):
                     output = await self.execute_node(node, inputs, outputs)
                 if len(output.encode("utf-8")) > self.settings.max_output_bytes:
                     raise NodeFailure("Node output exceeds the configured byte limit")
-                self.store.finish_node(run_id, node["id"], "succeeded", output=output)
+                await self.db.call("finish_node", run_id, node["id"], "succeeded", output=output)
         except asyncio.CancelledError:
-            if started:
-                self.store.finish_node(run_id, node["id"], "interrupted", error="Execution cancelled")
+            if start_requested:
+                detail = await self.db.call("get_run", tenant_id, run_id)
+                state = next(item for item in detail["nodes"] if item["id"] == node["id"])
+                if state["status"] == "running":
+                    await self.db.call("finish_node", run_id, node["id"], "interrupted", error="Execution cancelled")
             raise
         except (TimeoutError, httpx.TimeoutException):
-            self.store.finish_node(run_id, node["id"], "failed", error="Node deadline exceeded")
+            await self.db.call("finish_node", run_id, node["id"], "failed", error="Node deadline exceeded")
         except NodeFailure as error:
-            self.store.finish_node(run_id, node["id"], "failed", error=str(error))
+            await self.db.call("finish_node", run_id, node["id"], "failed", error=str(error))
         except Exception:
-            self.store.finish_node(run_id, node["id"], "failed", error="Node execution failed")
+            await self.db.call("finish_node", run_id, node["id"], "failed", error="Node execution failed")
 
     async def execute_node(self, node, inputs, outputs):
         config = node["config"]
