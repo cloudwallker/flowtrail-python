@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .async_store import AsyncStore
 from .config import Settings
 from .models import SubmitRun
+from .observability import ReadinessMonitor, RequestDiagnostics
 from .runtime import Runtime
 from .store import DEFAULT_TOKEN_TTL, MAX_TOKEN_TTL, Store, StoreError, encode
 
@@ -66,18 +67,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     store = Store(settings)
     db = AsyncStore(store, max_workers=settings.db_workers, max_queue=settings.db_queue)
     runtime = Runtime(store, settings, db=db)
+    readiness = ReadinessMonitor(settings.db_path, runtime)
 
     @asynccontextmanager
     async def lifespan(app):
         await runtime.start()
         try:
+            await readiness.start()
             yield
         finally:
-            await runtime.stop()
+            try:
+                await readiness.close()
+            finally:
+                await runtime.stop()
 
     app = FastAPI(title="FlowTrail Python", version="0.1.0", lifespan=lifespan)
     app.add_middleware(BodyLimit, settings=settings)
+    app.add_middleware(RequestDiagnostics)
     app.state.store, app.state.runtime, app.state.db = store, runtime, db
+    app.state.readiness = readiness
     bearer = HTTPBearer(auto_error=False)
 
     async def identity(credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)]):
@@ -110,6 +118,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/healthz")
     def health():
         return {"status": "ok", "service": "flowtrail-python"}
+
+    @app.get('/readyz')
+    async def ready():
+        available = readiness.ready()
+        return JSONResponse({'status': 'ready' if available else 'not_ready'},
+                            status_code=200 if available else 503, headers={'Cache-Control': 'no-store'})
+
+    @app.get('/api/ops/summary')
+    async def operations_summary(current: Annotated[dict, Depends(administrator)]):
+        result = await db.call('operations_summary', current)
+        return JSONResponse(result, headers={'Cache-Control': 'no-store'})
 
     @app.get("/api/me")
     async def me(current: Annotated[dict, Depends(identity)]):

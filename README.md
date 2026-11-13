@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README_ZH.md)
 
-**A Python AI task platform with tenant-scoped access, recoverable DAG execution, and a React operations console.** Submit text, read-only HTTP, and inference tasks; inspect persisted events; and manage small objects within a tenant quota.
+**A Python AI task platform with tenant-scoped access, recoverable DAG execution, and a React operations console.** Submit text, read-only HTTP, and inference tasks; inspect persisted events; manage small objects within a tenant quota; and check service readiness with content-free request diagnostics.
 
 **中文简介：** 基于 Python、FastAPI 和 React 的单机 AI 任务平台，支持租户鉴权、DAG 编排、检查点恢复、事件回放与对象配额管理。
 
@@ -21,6 +21,7 @@
 | Event replay | SQLite-backed SSE with per-run sequence IDs and `Last-Event-ID` replay |
 | Object management | Tenant-scoped SQLite BLOB objects with an atomic byte quota check and write |
 | React console | Workflow templates, safe submission retries, run inspection, event history, object management, and quota display |
+| Operational diagnostics | Independent readiness probes, admin-only tenant state summaries, and server-generated request IDs with content-free logs |
 
 This is a focused Python continuation of [FlowTrail Server](https://github.com/cloudwallker/flowtrail-server). It targets reproducible local demonstrations of platform APIs, automation, inference integration, and authorization.
 
@@ -115,6 +116,8 @@ All business APIs require `Authorization: Bearer …`. Tenant identity comes fro
 | `GET /api/objects/{name}` | Download object bytes | All |
 | `DELETE /api/objects/{name}` | Delete an object | admin, operator |
 | `GET /api/quota` | Used, allowed, and remaining object bytes | All |
+| `GET /readyz` | Public readiness check | No token required |
+| `GET /api/ops/summary` | Current tenant counts and object quota | admin |
 | `GET /healthz` | Public health check | No token required |
 
 `admin` manages tokens and audit records and can perform business writes. `operator` can submit/resume workflows and manage objects, while `viewer` can only read business resources. Management APIs use the authenticated tenant; a request cannot supply another tenant. A foreign token ID returns 404.
@@ -137,6 +140,22 @@ The issue response contains the raw token once and uses `Cache-Control: no-store
 An existing database is upgraded transactionally. Legacy tokens retain their identity and expire 24 hours after their original creation; already old tokens therefore require a new bootstrap. No token value is rewritten or logged. Example: `python -m flowtrail bootstrap --tenant demo --role viewer --ttl-seconds 3600`.
 
 Object names use ASCII letters, digits, dot, dash, or underscore and start with a letter or digit. The default object limit is **5 MiB** and the default tenant object quota is **10 MiB**. Replacing an object accounts for its new size inside the same SQLite transaction. Quota measures object contents only; it does not measure database files, indexes, workflow history, or filesystem capacity.
+
+## Readiness and operational diagnostics
+
+```sh
+curl --fail-with-body http://127.0.0.1:8000/readyz
+curl --fail-with-body http://127.0.0.1:8000/api/ops/summary \
+  -H "Authorization: Bearer $FLOWTRAIL_API_TOKEN"
+```
+
+`/healthz` reports process responsiveness. `/readyz` additionally checks scheduler lifecycle and an independent read-only SQLite probe snapshot, returning 200 or 503. Defaults: one sample per second, 200 ms SQLite lock wait, three-second snapshot freshness. One dedicated worker runs at most one probe; requests read the snapshot without joining the business database queue. Unsampled startup, failed/stale probes, a stopped scheduler, and shutdown are unready. This does not establish write availability, disk capacity or provider health. Threads cannot forcibly interrupt OS-level blocked I/O; shutdown drains the submitted probe.
+
+Only admins may read `/api/ops/summary`. Revalidated authorization, tenant run/node state counts, object count and byte quota share one SQLite read snapshot. Responses include generation time and `Cache-Control: no-store`, with no workflow inputs/outputs. These are on-demand counts, not a cross-tenant metric service; Prometheus/Grafana is not implemented.
+
+HTTP responses carry a server-generated `X-Request-ID`, ignoring supplied IDs. JSON `flowtrail.requests` logs contain ID, method, route template, HTTP status, duration and transport outcome, excluding raw paths, query strings, credentials, bodies and exception details. SSE logs `response_started` separately from `request_finished`. `completed` describes transport completion, not business success. A midstream SSE error produces a safe error event; an interrupted ordinary response is left incomplete for the server to close.
+
+The project `serve` entry disables Uvicorn's raw access log. Pass `--no-access-log` if launching Uvicorn directly. Access `/readyz` on the backend port; the development frontend still proxies only `/api` and `/healthz`. Dockerfile now probes `/readyz`; the container has not been built or run.
 
 ## Server configuration
 
@@ -194,7 +213,9 @@ npm test
 npm run build
 ```
 
-The 2026-10-23 local verification passed **51 backend tests** and **21 frontend tests**. Coverage includes token expiry/revocation/migration/audit, role and tenant isolation, concurrent quotas, DAG validation, idempotency conflicts, deadlines, resume, cancellation during database commits, process ownership, and bounded templates. A real SQLite write lock verifies that an unrelated heartbeat and the HTTP health endpoint keep responding. Frontend tests cover lost responses, timeouts, payload/identity changes, HTTP/stream session invalidation, and late responses from an old session. Event regressions cover 1,500 persisted events and token expiry/revocation between storage batches.
+The 2026-11-13 local verification passed **66 backend tests** and **21 frontend tests**. Coverage includes token expiry/revocation/migration/audit, role and tenant isolation, concurrent quotas, DAG validation, idempotency conflicts, deadlines, resume, cancellation during database commits, process ownership, and bounded templates. A real SQLite write lock verifies that an unrelated heartbeat and the HTTP health endpoint keep responding. Frontend tests cover lost responses, timeouts, payload/identity changes, HTTP/stream session invalidation, and late responses from an old session. Event regressions cover 1,500 persisted events and token expiry/revocation between storage batches.
+
+A previous recovery smoke run passed its business assertions but failed while removing a temporary Windows lock file. An unchanged rerun exited successfully. The transient holder was not identified; cleanup reliability remains a recorded limitation. The 66 tests include readiness, operational summaries, request diagnostics and failure boundaries.
 
 The smoke script starts real local processes, creates temporary credentials and a database, forcibly terminates the server after a successful checkpoint, and restarts it. It verifies one call to the completed node, another attempt for the unfinished node, persistent object contents, event replay, and request idempotency. It prints a result summary without the access token.
 

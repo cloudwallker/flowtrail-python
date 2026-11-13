@@ -316,6 +316,26 @@ class Store:
             used = db.execute("SELECT COALESCE(SUM(size_bytes),0) FROM objects WHERE tenant_id=?", (tenant_id,)).fetchone()[0]
             return {"used_bytes": used, "limit_bytes": limit, "remaining_bytes": limit - used}
 
+    def operations_summary(self, actor):
+        """All counters, permissions and quota belong to one tenant/read snapshot."""
+        with self.connection() as db:
+            db.execute('BEGIN')
+            self._require_admin(db, actor)
+            tenant_id = actor['tenant_id']
+            run_counts = dict.fromkeys(('queued', 'running', 'succeeded', 'failed', 'interrupted'), 0)
+            node_counts = dict.fromkeys(('pending', 'running', 'succeeded', 'failed', 'interrupted', 'skipped'), 0)
+            run_counts.update((row['status'], row['count']) for row in db.execute(
+                'SELECT status,COUNT(*) AS count FROM runs WHERE tenant_id=? GROUP BY status', (tenant_id,)))
+            node_counts.update((row['status'], row['count']) for row in db.execute(
+                'SELECT n.status,COUNT(*) AS count FROM nodes n JOIN runs r ON r.id=n.run_id '
+                'WHERE r.tenant_id=? GROUP BY n.status', (tenant_id,)))
+            objects = db.execute('SELECT COUNT(*) AS count,COALESCE(SUM(size_bytes),0) AS used '
+                                 'FROM objects WHERE tenant_id=?', (tenant_id,)).fetchone()
+            limit = db.execute('SELECT quota_bytes FROM tenants WHERE id=?', (tenant_id,)).fetchone()[0]
+            return {'generated_at': now(), 'runs': run_counts, 'nodes': node_counts,
+                    'objects': {'count': objects['count'], 'used_bytes': objects['used'],
+                                'limit_bytes': limit, 'remaining_bytes': limit - objects['used']}}
+
     def list_objects(self, tenant_id):
         with self.connection() as db:
             return [dict(row) for row in db.execute("SELECT name,size_bytes,sha256,updated_at FROM objects WHERE tenant_id=? ORDER BY name", (tenant_id,))]

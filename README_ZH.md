@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README_ZH.md)
 
-**基于 Python、FastAPI 和 React 的单机 AI 任务平台，支持租户鉴权、DAG 编排、检查点恢复、事件回放与对象配额管理。** 可以提交文本处理、只读 HTTP 和推理任务，在控制台观察运行过程，并按租户管理小型文件对象。
+**基于 Python、FastAPI 和 React 的单机 AI 任务平台，支持租户鉴权、DAG 编排、检查点恢复、事件回放与对象配额管理。** 可以提交文本处理、只读 HTTP 和推理任务，在控制台观察运行过程，按租户管理小型文件对象，并通过独立就绪检查与不记录请求内容的日志诊断服务。
 
 **English:** A Python AI task platform with tenant-scoped access, recoverable DAG execution, and a React operations console.
 
@@ -21,6 +21,7 @@
 | 事件回放 | SQLite 持久化 SSE 事件，支持运行内序号和 Last-Event-ID |
 | 对象管理 | 按租户隔离 SQLite BLOB，对象写入与字节配额检查使用同一事务 |
 | React 控制台 | 工作流模板、提交失败安全重试、运行详情、事件历史、对象管理及配额展示 |
+| 运行诊断 | 独立就绪探测、仅管理员可读的租户状态汇总，以及服务端生成的请求 ID 与不记录请求内容的日志 |
 
 本项目延续 [FlowTrail Server](https://github.com/cloudwallker/flowtrail-server) 的工作流设计，用 Python 实现适合本地复现的平台接口、自动化、推理接入和权限管理闭环。
 
@@ -115,6 +116,8 @@ curl --fail-with-body "http://127.0.0.1:8000/api/runs/$RUN_ID/events?follow=fals
 | `GET /api/objects/{name}` | 下载对象正文 | 全部 |
 | `DELETE /api/objects/{name}` | 删除对象 | admin、operator |
 | `GET /api/quota` | 已用、上限和剩余对象字节数 | 全部 |
+| `GET /readyz` | 公开就绪检查 | 无需 token |
+| `GET /api/ops/summary` | 当前租户状态计数与对象配额 | admin |
 | `GET /healthz` | 公开健康检查 | 无需 token |
 
 `admin` 管理本租户令牌、查看管理审计，也可执行业务写操作；`operator` 可提交/恢复工作流和管理对象；`viewer` 只读业务资源。管理接口的租户由已认证身份决定，请求不能指定其他租户，访问其他租户的令牌 ID 返回 404。
@@ -137,6 +140,22 @@ curl --fail-with-body -X DELETE \
 旧数据库会自动执行事务迁移。既有令牌保留身份，有效期按原创建时间加 24 小时计算；已经过期的旧令牌需重新 bootstrap。迁移不改写或记录明文令牌。例如 `python -m flowtrail bootstrap --tenant demo --role viewer --ttl-seconds 3600`。
 
 对象名称使用 ASCII 字母、数字、点、连字符或下划线，并以字母或数字开头。默认单对象上限 **5 MiB**，租户对象配额 **10 MiB**。替换对象时，在同一 SQLite 事务内按新大小核算。配额只统计对象正文，不代表数据库文件、索引、工作流历史或文件系统的磁盘占用。
+
+## 就绪检查与运行诊断
+
+```sh
+curl --fail-with-body http://127.0.0.1:8000/readyz
+curl --fail-with-body http://127.0.0.1:8000/api/ops/summary \
+  -H "Authorization: Bearer $FLOWTRAIL_API_TOKEN"
+```
+
+`/healthz` 表示进程可响应；`/readyz` 还检查调度器生命周期与独立 SQLite 只读探测快照，返回 200 或 503。默认每秒采样一次，SQLite 锁等待最多 200 ms，成功快照 3 秒后失效。探测只有一个后台工作线程和一个在途任务，端点读取快照，不进入业务数据库等待队列。启动尚未成功探测、探测失败/过期、调度器退出和关闭期间均不就绪。它不证明数据库可写、磁盘有容量或远端模型健康；操作系统阻塞 I/O 不能被线程超时强制终止，关闭会等待已投递探测收敛。
+
+`/api/ops/summary` 仅 admin 可读。鉴权复查、当前租户运行/节点的状态计数、对象数量和字节配额处于同一个 SQLite 读取快照；响应含生成时间和 `Cache-Control: no-store`，不含任务输入输出。该端点是按需统计，不是跨租户指标后台，也没有 Prometheus/Grafana。
+
+HTTP 响应带服务端生成的 `X-Request-ID`，不接受客户端伪造值。`flowtrail.requests` 输出 JSON 日志：请求 ID、方法、路由模板、HTTP 状态、耗时和传输结果；不记录查询串、原始路径、凭据、正文或底层异常。SSE 分别记录 `response_started` 与 `request_finished`；`completed` 表示传输完成，不等于业务成功。流中途异常返回安全错误事件，普通响应中途异常保持不完整并由服务器断开。
+
+项目 `serve` 入口已经关闭 Uvicorn 原始 access log。若直接启动 Uvicorn，应传 `--no-access-log`，避免另一套日志记录原始查询串。新增 `/readyz` 建议直接访问后端 8000 端口，开发前端代理仍只配置 `/api` 和 `/healthz`。Dockerfile 已接入 `/readyz` 健康检查，尚未实际构建或运行容器。
 
 ## 服务端配置
 
@@ -194,7 +213,9 @@ npm test
 npm run build
 ```
 
-2026-10-23 的本地验证通过 **51 项后端测试**及 **21 项前端测试**。覆盖令牌过期/撤销/迁移/审计、角色与租户隔离、并发配额、DAG 校验、幂等冲突、截止时间、恢复、数据库提交期间取消、进程锁与模板预算。真实 SQLite 持锁测试验证心跳和 HTTP 健康接口仍可响应。前端覆盖丢响应、超时重试、载荷/身份变化、HTTP/流内身份失效及旧会话迟到响应。事件回归包含 1,500 条持久化历史与跨批次过期/撤销。
+2026-11-13 的本地验证通过 **66 项后端测试**及 **21 项前端测试**。覆盖令牌过期/撤销/迁移/审计、角色与租户隔离、并发配额、DAG 校验、幂等冲突、截止时间、恢复、数据库提交期间取消、进程锁与模板预算。真实 SQLite 持锁测试验证心跳和 HTTP 健康接口仍可响应。前端覆盖丢响应、超时重试、载荷/身份变化、HTTP/流内身份失效及旧会话迟到响应。事件回归包含 1,500 条持久化历史与跨批次过期/撤销。
+
+此前的恢复冒烟第一次在业务断言全部通过后遇到 Windows 临时锁文件清理失败；原样重跑退出 0，未修改清理逻辑。该偶发占用尚未定位具体持有者，保留为复现限制。新增就绪、运行汇总、请求日志及故障边界测试包含在上述 66 项内。
 
 冒烟脚本启动真实本地进程，使用临时凭据与数据库，在首个成功检查点后强制终止服务，再重新启动。验证已完成节点只调用一次、未完成节点再次尝试、对象数据持久化、事件回放和请求幂等；输出结果摘要，不输出访问 token。
 
