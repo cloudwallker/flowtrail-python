@@ -171,25 +171,34 @@ class AsyncStoreTests(unittest.IsolatedAsyncioTestCase):
     async def test_shutdown_drains_committed_node_start_before_releasing_process_lock(self):
         entered, release = threading.Event(), threading.Event()
 
+        class ObservedRuntime(Runtime):
+            async def _execute(self, *args):
+                self.node_task = asyncio.current_task()
+                return await super()._execute(*args)
+
         class DelayedStartStore(Store):
             def start_node(self, run_id, node_id):
                 result = super().start_node(run_id, node_id)
                 entered.set()
-                release.wait(2)
+                if not release.wait(10):
+                    raise TimeoutError("Test did not release the committed node start")
                 return result
 
         store = DelayedStartStore(self.settings)
         run = store.submit("demo", {"workflow": {"name": "drain", "nodes": [
             {"id": "text", "type": "text", "depends_on": [], "config": {"template": "hello"}}]},
             "inputs": {}}, "drain-node")
-        runtime = Runtime(store, self.settings)
+        runtime = ObservedRuntime(store, self.settings)
         await runtime.start()
         while not entered.is_set():
             await asyncio.sleep(0.005)
         stop = asyncio.create_task(runtime.stop())
-        await asyncio.sleep(0.03)
         competitor = RuntimeLock(self.settings.db_path)
         try:
+            # Shutdown first drains the scheduler, then cancels the active node.
+            async with asyncio.timeout(5):
+                while not runtime.node_task.cancelling():
+                    await asyncio.sleep(0.005)
             self.assertFalse(stop.done())
             with self.assertRaises(RuntimeError):
                 competitor.acquire()
