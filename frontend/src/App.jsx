@@ -77,6 +77,8 @@ export default function App() {
   const api = useMemo(() => session.current.api(token), [token, identity]);
   const connected = Boolean(identity && token);
   const writable = connected && ['admin', 'operator'].includes(identity.role);
+  const resumableState = run && ['failed', 'interrupted'].includes(run.status);
+  const canResume = run?.resume?.eligible ?? resumableState;
   const successful = runs.filter(item => item.status === 'succeeded').length;
   const active = runs.filter(item => ['queued', 'running'].includes(item.status)).length;
   const usedPercent = quota?.limit_bytes > 0 ? Math.min(100, quota.used_bytes / quota.limit_bytes * 100) : 0;
@@ -258,7 +260,8 @@ export default function App() {
 
           <section className="panel detail-panel" aria-labelledby="detail-title"><div className="panel-heading"><div><h2 id="detail-title">执行详情</h2><p>{run ? run.name : '节点状态与可恢复执行'}</p></div>{run && <Status value={run.status} />}</div>
             {detailError && <p className="inline-error detail-error" role="alert">{detailError}</p>}
-            {run ? <div className="run-detail"><div className="run-meta"><span>RUN ID <code title={run.id}>{run.id}</code></span><button className="button small secondary" disabled={!writable || busy !== '' || !['failed', 'interrupted'].includes(run.status)} onClick={() => action('resume', () => api.resume(run.id), () => setNotice({ type: 'success', text: '恢复请求已提交，已成功节点将从检查点复用。' }))}><Icon name="refresh" size={15} />{busy === 'resume' ? '恢复中…' : '恢复运行'}</button></div>
+            {run ? <div className="run-detail"><div className="run-meta"><span>RUN ID <code title={run.id}>{run.id}</code></span><button className="button small secondary" disabled={!writable || busy !== '' || !canResume} onClick={() => action('resume', () => api.resume(run.id), () => setNotice({ type: 'success', text: '恢复请求已提交，已成功节点将从检查点复用。' }))}><Icon name="refresh" size={15} />{busy === 'resume' ? '恢复中…' : '恢复运行'}</button></div>
+              {resumableState && run.resume?.exhausted_nodes.length > 0 && <p className="inline-error">无法恢复：以下节点已用完 {run.resume.max_attempts} 次执行机会：{run.resume.exhausted_nodes.join('、')}。</p>}
               <div className="node-track">{run.nodes?.map((node, index) => <div key={node.id} className={`node-card node-${node.status}`}><div className="node-index">{node.status === 'succeeded' ? <Icon name="check" size={17} /> : String(index + 1).padStart(2, '0')}</div><div className="node-title"><strong>{node.id}</strong><small>{node.type}</small></div><Status value={node.status} /></div>)}</div>
               {run.error && <p className="inline-error" role="alert">{run.error}</p>}
               <div className="node-outputs">{run.nodes?.map(node => <details key={node.id}><summary><span><Icon name="code" size={15} />{node.id} <small>第 {node.attempt ?? 0} 次执行</small></span><span>{node.error ? '错误详情' : '输出详情'}</span></summary>{node.error && <p className="inline-error">{node.error}</p>}{node.output != null ? <Output value={node.output} /> : <p className="output-empty">该节点尚无输出。</p>}</details>)}</div>

@@ -144,8 +144,8 @@ class Runtime:
             async with self.capacity:
                 start_requested = True
                 attempt = await self.db.call("start_node", run_id, node["id"])
-                if attempt > 5:
-                    raise NodeFailure("Node attempt budget exhausted (maximum 5)")
+                if attempt is None:
+                    return
                 async with asyncio.timeout(node["config"].get("timeout_seconds", 10)):
                     output = await self.execute_node(node, inputs, outputs)
                 if len(output.encode("utf-8")) > self.settings.max_output_bytes:

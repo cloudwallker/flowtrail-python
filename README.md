@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README_ZH.md)
 
-**A Python AI task platform with tenant-scoped access, recoverable DAG execution, and a React operations console.** Submit text, read-only HTTP, and inference tasks; inspect persisted events; manage small objects within a tenant quota; and check service readiness with content-free request diagnostics.
+**A Python AI task platform with tenant-scoped access, recoverable DAG execution, and a React operations console.** Submit text, read-only HTTP, and inference tasks, inspect persisted events and see which failed workflows can resume from checkpoints. The platform also manages small objects within a tenant quota and exposes service readiness diagnostics.
 
 **中文简介：** 基于 Python、FastAPI 和 React 的单机 AI 任务平台，支持租户鉴权、DAG 编排、检查点恢复、事件回放与对象配额管理。
 
@@ -109,7 +109,7 @@ All business APIs require `Authorization: Bearer …`. Tenant identity comes fro
 | `GET /api/runs` | Most recent 100 runs in the tenant | All |
 | `POST /api/runs` | Submit a workflow and inputs | admin, operator |
 | `GET /api/runs/{id}` | Definition, node attempts, outputs, and status | All |
-| `POST /api/runs/{id}/resume` | Resume a failed or interrupted run | admin, operator |
+| `POST /api/runs/{id}/resume` | Resume a failed or interrupted run with attempts available for every unfinished node | admin, operator |
 | `GET /api/runs/{id}/events` | SSE event history and follow | All |
 | `GET /api/objects` | List tenant objects | All |
 | `PUT /api/objects/{name}` | Create or replace an object using raw bytes | admin, operator |
@@ -194,7 +194,7 @@ Inference nodes default to `"mode":"mock"`, which returns a clearly labeled dete
 - **One serving process owns one local SQLite database.** An OS-level exclusive lock rejects a second server using the same database. Use local storage and one Uvicorn worker.
 - A dedicated bounded worker pool runs complete Store methods, including their connection and transaction. Async API, event, and runtime paths await this pool. Cancellation drains an already submitted operation before returning; shutdown drains database work before releasing the process lock. A client disconnect can still leave an accepted transaction committed, so retries must reuse an idempotency key.
 - Node results and their events commit together. Startup recovers queued and interrupted work, preserving successful checkpoints. A failed run requires an explicit resume; successful nodes are retained while unfinished nodes are reset.
-- Failed nodes are not automatically retried. Each node may execute at most five times across recovery and explicit resume. Each execution cycle has a 300-second run deadline; node deadlines default to 10 seconds and accept 0.05–120 seconds.
+- Failed nodes are not automatically retried. Each node may execute at most five times across recovery and explicit resume. `GET /api/runs/{id}` includes a `resume` object with `eligible`, `max_attempts`, and `exhausted_nodes`. After the fifth unsuccessful attempt, the console names the blocking nodes and the resume endpoint returns 409 without changing the recorded history. A successful fifth attempt remains a reusable checkpoint. Each execution cycle has a 300-second run deadline; node deadlines default to 10 seconds and accept 0.05–120 seconds.
 - A failed node prevents downstream work from starting; already submitted independent work settles before the run finishes. Graceful shutdown cancels active work and records interruption.
 - DAGs contain at most 32 nodes. Request bodies, rendered templates, upstream responses, and node outputs have bounded sizes; the default non-object request and output limit is 256 KiB.
 - A cancelled or interrupted remote inference request may continue upstream. Recovery can send it again and incur another charge. The platform cannot retract a remote request.

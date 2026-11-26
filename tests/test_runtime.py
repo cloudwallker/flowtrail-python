@@ -138,6 +138,57 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual([n["attempt"] for n in run["nodes"]], [1, 2, 1])
         self.assertEqual(self.upstream.calls["/ok"], 1)
 
+    def test_resume_rejects_an_exhausted_node_without_changing_its_history(self):
+        run_id = self.create([self.http("done", "ok"), self.http("fetch", "fail", ["done"])])
+        for attempt in range(1, 6):
+            detail = self.wait(run_id)
+            self.assertEqual(detail["nodes"][1]["attempt"], attempt)
+            if attempt < 5:
+                self.assertTrue(detail["resume"]["eligible"])
+                self.assertEqual(self.client.post(f"/api/runs/{run_id}/resume", headers=self.headers).status_code, 202)
+        history = self.store.events("demo", run_id)
+        self.assertEqual(self.client.post(f"/api/runs/{run_id}/resume", headers=self.headers).status_code, 409)
+        self.assertEqual(self.get(run_id), detail)
+        self.assertEqual(self.store.events("demo", run_id), history)
+        self.assertEqual(detail["resume"], {"eligible": False, "max_attempts": 5, "exhausted_nodes": ["fetch"]})
+        self.assertEqual(self.upstream.calls["/fail"], 5)
+        self.assertEqual(self.upstream.calls["/ok"], 1)
+
+    def test_restart_handles_exhausted_work_and_reuses_final_attempt_checkpoints(self):
+        self.close_client()
+        try:
+            nodes = [self.http("one", "ok"), self.http("two", "ok", ["one"])]
+            definition = SubmitRun.model_validate({"workflow": {"name": "restart", "nodes": nodes}}).model_dump()
+
+            def saved(run_status, first_status, attempt):
+                run_id = self.store.submit("demo", definition, None)["id"]
+                with self.store.connection(True) as db:
+                    db.execute("UPDATE runs SET status=? WHERE id=?", (run_status, run_id))
+                    db.execute("UPDATE nodes SET status=?,attempt=?,output=? WHERE run_id=? AND id='one'",
+                               (first_status, attempt, "checkpoint" if first_status == "succeeded" else None, run_id))
+                return run_id
+
+            stale = [saved("running", "running", 5), saved("queued", "pending", 6),
+                     saved("interrupted", "interrupted", 5)]
+            healthy = saved("interrupted", "succeeded", 5)
+            self.store.recover()
+            for run_id in stale:
+                detail = self.store.get_run("demo", run_id)
+                self.assertEqual(detail["status"], "failed")
+                self.assertEqual(detail["resume"]["exhausted_nodes"], ["one"])
+                self.assertEqual(detail["nodes"][1]["status"], "skipped")
+                events = self.store.events("demo", run_id)
+                self.assertEqual(events[-1]["type"], "RUN_FAILED")
+                self.store.recover()
+                self.assertEqual(self.store.events("demo", run_id), events)
+        finally:
+            self.open_client()
+        result = self.wait(healthy)
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["nodes"][0]["attempt"], 5)
+        self.assertEqual(result["nodes"][0]["output"], "checkpoint")
+        self.assertEqual(self.upstream.calls["/ok"], 1)
+
     def test_shutdown_interrupts_and_startup_resumes_only_unfinished_nodes(self):
         run_id = self.create([self.http("first", "ok"), self.http("second", "slow", ["first"])])
         self.wait(run_id, lambda run: run["nodes"][0]["status"] == "succeeded" and run["nodes"][1]["status"] == "running")

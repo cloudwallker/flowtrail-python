@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README_ZH.md)
 
-**基于 Python、FastAPI 和 React 的单机 AI 任务平台，支持租户鉴权、DAG 编排、检查点恢复、事件回放与对象配额管理。** 可以提交文本处理、只读 HTTP 和推理任务，在控制台观察运行过程，按租户管理小型文件对象，并通过独立就绪检查与不记录请求内容的日志诊断服务。
+**基于 Python、FastAPI 和 React 的单机 AI 任务平台，支持租户鉴权、DAG 编排、检查点恢复、事件回放与对象配额管理。** 可以提交文本处理、只读 HTTP 和推理任务，在控制台查看执行事件及失败任务能否恢复，按租户管理小型文件对象，并通过独立就绪检查与不记录请求内容的日志诊断服务。
 
 **English:** A Python AI task platform with tenant-scoped access, recoverable DAG execution, and a React operations console.
 
@@ -109,7 +109,7 @@ curl --fail-with-body "http://127.0.0.1:8000/api/runs/$RUN_ID/events?follow=fals
 | `GET /api/runs` | 当前租户最近 100 个运行 | 全部 |
 | `POST /api/runs` | 提交工作流与输入 | admin、operator |
 | `GET /api/runs/{id}` | 定义、节点尝试、输出和状态 | 全部 |
-| `POST /api/runs/{id}/resume` | 恢复 failed/interrupted 运行 | admin、operator |
+| `POST /api/runs/{id}/resume` | 恢复所有未完成节点都还有执行机会的 failed/interrupted 运行 | admin、operator |
 | `GET /api/runs/{id}/events` | SSE 历史回放与跟随 | 全部 |
 | `GET /api/objects` | 列出租户对象 | 全部 |
 | `PUT /api/objects/{name}` | 使用原始字节新建或替换对象 | admin、operator |
@@ -194,7 +194,7 @@ HTTP 节点仅选择 `{"connector":"demo-health"}`，不能提交 URL、方法�
 - **一个服务进程独占一个本地 SQLite 数据库。** OS 排他锁会拒绝第二个服务进程使用相同数据库；使用本地磁盘和单个 Uvicorn worker。
 - 独立有界线程池执行完整 Store 方法，连接创建、事务和关闭均在同一工作线程；异步 API、事件流和调度器等待其结果。已投递操作会在取消传播前完成收敛；关闭服务先收敛数据库工作，再释放进程锁。客户端断开时，已接受事务仍可能提交，因此重试必须复用幂等键。
 - 节点结果和事件在同一事务提交。启动时恢复排队及中断任务，保留成功检查点。failed 运行需要显式 resume；恢复时保留成功节点，重置未完成节点。
-- 失败节点不会自动重试。每节点累计最多执行 5 次，包括中断恢复与显式 resume。每轮执行的运行截止时间为 300 秒，节点默认 10 秒，可设为 0.05–120 秒。
+- 失败节点不会自动重试。每节点累计最多执行 5 次，包括中断恢复与显式 resume。`GET /api/runs/{id}` 的 `resume` 对象说明能否恢复（`eligible`）、次数上限（`max_attempts`）和已用尽次数的节点（`exhausted_nodes`）。第五次仍未成功时，控制台会列出阻止恢复的节点；恢复请求返回 409，并保留原运行记录。第五次成功的节点仍可复用其检查点。每轮执行的运行截止时间为 300 秒，节点默认 10 秒，可设为 0.05–120 秒。
 - 节点失败后不再启动依赖它的后续节点；已投递的独立任务收敛后结束运行。正常关闭服务会取消进行中的工作并记录中断。
 - DAG 最多包含 32 个节点。请求体、模板展开、上游响应和节点输出均有大小限制；默认非对象请求及输出上限为 256 KiB。
 - 中断本地推理请求不保证远端停止。恢复后再次调用可能重复计费，平台无法撤销已经发送的远端请求。
