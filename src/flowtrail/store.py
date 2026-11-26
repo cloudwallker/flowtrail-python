@@ -13,6 +13,8 @@ from .config import Settings
 
 DEFAULT_TOKEN_TTL = 86400
 MAX_TOKEN_TTL = 30 * 86400
+MAX_NODE_ATTEMPTS = 5
+ATTEMPT_LIMIT_ERROR = f"Node attempt budget exhausted (maximum {MAX_NODE_ATTEMPTS})"
 
 
 class StoreError(Exception):
@@ -236,17 +238,32 @@ class Store:
         result.update(json.loads(row["definition"]))
         result["nodes"] = [dict(item) for item in db.execute(
             "SELECT id,type,status,attempt,output,error,started_at,finished_at FROM nodes WHERE run_id=? ORDER BY position", (run_id,))]
+        result["resume"] = self._resume_info(row["status"], result["nodes"])
         return result
 
     def get_run(self, tenant_id, run_id):
         with self.connection() as db:
+            db.execute("BEGIN")
             return self._detail(db, tenant_id, run_id)
+
+    @staticmethod
+    def _resume_info(status, nodes):
+        exhausted = [node["id"] for node in nodes
+                     if node["status"] != "succeeded" and node["attempt"] >= MAX_NODE_ATTEMPTS]
+        return {"eligible": status in {"failed", "interrupted"} and not exhausted,
+                "max_attempts": MAX_NODE_ATTEMPTS, "exhausted_nodes": exhausted}
+
+    @staticmethod
+    def _attempts(db, run_id):
+        return db.execute("SELECT id,status,attempt FROM nodes WHERE run_id=? ORDER BY position", (run_id,))
 
     def resume(self, tenant_id, run_id):
         with self.connection(True) as db:
             run = self.require_run(db, tenant_id, run_id)
             if run["status"] not in {"failed", "interrupted"}:
                 raise StoreError(409, "Only failed or interrupted runs can be resumed")
+            if self._resume_info(run["status"], self._attempts(db, run_id))["exhausted_nodes"]:
+                raise StoreError(409, ATTEMPT_LIMIT_ERROR)
             count = db.execute("SELECT COUNT(*) FROM runs WHERE status IN ('queued','running')").fetchone()[0]
             if count >= self.settings.max_pending_runs:
                 raise StoreError(429, "The run queue is full; retry later")
@@ -258,8 +275,20 @@ class Store:
     def recover(self):
         """Only called after acquiring the exclusive process lock."""
         with self.connection(True) as db:
-            for run in db.execute("SELECT id FROM runs WHERE status IN ('running','interrupted')").fetchall():
+            for run in db.execute("SELECT id,status FROM runs WHERE status IN ('running','interrupted','queued')").fetchall():
                 run_id = run["id"]
+                if self._resume_info(run["status"], self._attempts(db, run_id))["exhausted_nodes"]:
+                    stamp = now()
+                    # A crash can leave an in-flight final attempt, or a pending node from a legacy resume.
+                    db.execute("UPDATE nodes SET status='interrupted',error='Execution interrupted',finished_at=? "
+                               "WHERE run_id=? AND status='running'", (stamp, run_id))
+                    db.execute("UPDATE nodes SET status='failed',error=?,finished_at=? "
+                               "WHERE run_id=? AND status='pending' AND attempt>=?",
+                               (ATTEMPT_LIMIT_ERROR, stamp, run_id, MAX_NODE_ATTEMPTS))
+                    self._finish_run(db, run_id, "failed", ATTEMPT_LIMIT_ERROR)
+                    continue
+                if run["status"] == "queued":
+                    continue
                 db.execute("UPDATE nodes SET status='pending',output=NULL,error=NULL,started_at=NULL,finished_at=NULL WHERE run_id=? AND status!='succeeded'", (run_id,))
                 db.execute("UPDATE runs SET status='queued',error=NULL,updated_at=? WHERE id=?", (now(), run_id))
                 self.event(db, run_id, "RUN_RECOVERED")
@@ -277,8 +306,18 @@ class Store:
 
     def start_node(self, run_id, node_id):
         with self.connection(True) as db:
-            db.execute("UPDATE nodes SET status='running',attempt=attempt+1,started_at=?,finished_at=NULL,error=NULL WHERE run_id=? AND id=? AND status='pending'", (now(), run_id, node_id))
-            attempt = db.execute("SELECT attempt FROM nodes WHERE run_id=? AND id=?", (run_id, node_id)).fetchone()[0]
+            row = db.execute("SELECT status,attempt FROM nodes WHERE run_id=? AND id=?", (run_id, node_id)).fetchone()
+            if row is None or row["status"] != "pending":
+                return None
+            if row["attempt"] >= MAX_NODE_ATTEMPTS:
+                db.execute("UPDATE nodes SET status='failed',error=?,finished_at=? WHERE run_id=? AND id=?",
+                           (ATTEMPT_LIMIT_ERROR, now(), run_id, node_id))
+                self.event(db, run_id, "NODE_ATTEMPTS_EXHAUSTED", node_id, row["attempt"],
+                           {"error": ATTEMPT_LIMIT_ERROR})
+                return None
+            attempt = row["attempt"] + 1
+            db.execute("UPDATE nodes SET status='running',attempt=?,started_at=?,finished_at=NULL,error=NULL WHERE run_id=? AND id=?",
+                       (attempt, now(), run_id, node_id))
             self.event(db, run_id, "NODE_STARTED", node_id, attempt)
             return attempt
 
@@ -293,12 +332,15 @@ class Store:
 
     def finish_run(self, run_id, status, error=None):
         with self.connection(True) as db:
-            db.execute("UPDATE runs SET status=?,error=?,updated_at=? WHERE id=?", (status, error, now(), run_id))
-            if status == "failed":
-                db.execute("UPDATE nodes SET status='skipped',error='Stopped after node failure' WHERE run_id=? AND status='pending'", (run_id,))
-            if status == "interrupted":
-                db.execute("UPDATE nodes SET status='interrupted',error='Server stopped during execution',finished_at=? WHERE run_id=? AND status='running'", (now(), run_id))
-            self.event(db, run_id, "RUN_" + status.upper(), data={"error": error} if error else {})
+            self._finish_run(db, run_id, status, error)
+
+    def _finish_run(self, db, run_id, status, error):
+        db.execute("UPDATE runs SET status=?,error=?,updated_at=? WHERE id=?", (status, error, now(), run_id))
+        if status == "failed":
+            db.execute("UPDATE nodes SET status='skipped',error='Stopped after node failure' WHERE run_id=? AND status='pending'", (run_id,))
+        if status == "interrupted":
+            db.execute("UPDATE nodes SET status='interrupted',error='Server stopped during execution',finished_at=? WHERE run_id=? AND status='running'", (now(), run_id))
+        self.event(db, run_id, "RUN_" + status.upper(), data={"error": error} if error else {})
 
     def events(self, tenant_id, run_id, after=0):
         with self.connection() as db:
